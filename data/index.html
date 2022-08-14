@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" type="text/css" media="screen and (max-device-width: 600px)" href="./Android.css" />
+  <link rel="stylesheet" type="text/css" media="screen and (min-width: 600px)" href="./PC.css" />
+  <title>健康上报</title>
+  <script src="./jquery-3.5.1.min.js"></script>
+  <!-- 最新的 Bootstrap 核心 JavaScript 文件 -->
+  <script src="./bootstrap.min.js"></script>
+  <!-- 最新版本的 Bootstrap 核心 CSS 文件 -->
+  <link rel="stylesheet" href="./bootstrap.min.css" />
+</head>
+
+<body>
+  <p class="title">CSCD参数配置</p>
+  <div class="left">
+    <div class="inputDiv">
+      <div class="movieName">
+        <span>WIFI名称：</span>
+        <input class="form-control" placeholder="请输入新的WIFI" id="ssid" class="movieNameInput" />
+      </div>
+
+      <div class="funny">
+        <span>WIFI密码：</span>
+        <input class="form-control" placeholder="请输入密码" id="password" type="password" />
+      </div>
+      <div class="funny">
+        <span>屏幕亮度：</span>
+        <input class="form-control" placeholder="0~100" id="scrLight" oninput="value=value.replace(/[^\d]/g,'')" />
+      </div>
+      <div class="funny">
+        <buttun class="btn btn-info" style="margin-left: 20px;margin-top: 20px;" id="sendBtn">提交
+        </buttun>
+      </div>
+
+      <div class="funny">
+        <span>结果：</span><span id="result" style="color: lawngreen; font-size: 25px">***</span>
+      </div><br><br><br>
+    </div>
+  </div>
+
+
+  <script>
+    var datas
+
+    $(function () {
+      $("#sendBtn").on("click", function () {
+        var ssid = document.getElementById('ssid').value;
+        var scrLight = document.getElementById('scrLight').value;
+        var password = document.getElementById('password').value;
+        var result = document.getElementById('result');
+        
+
+        // var data = {
+        //   'ssid': ssid,
+        //   'password': password,
+        //   'scrLight': scrLight,
+        // }
+        // var json = JSON.stringify(data);
+
+        $.ajax({
+          url: "/wifi?ssid=" + ssid + "&password=" + password + "&scrLight=" + scrLight,
+          type: "GET",
+          contentType: 'application/json;charset=UTF-8',
+          cache: "false",
+          dataType: "json",
+          success: function (res) {
+              result.innerHTML = res;
+          }
+        });
+      });
+    });
+
+  </script>
+</body>
+
+</html>

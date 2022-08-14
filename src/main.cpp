@@ -1,0 +1,674 @@
+#include <Servo.h>
+#include <SimpleDHT.h>
+#include "SPIFFS.h" // 本程序使用SPIFFS库
+#include <WiFi.h>
+#include <WebServer.h>
+#include <PubSubClient.h>
+#include "ArduinoNvs.h"
+#include <Ticker.h>
+
+#define SERVOPINH 16 //水平舵机
+#define SERVOPINV 17 //垂直舵机
+#define motorPin1 25
+#define motorPin2 26
+#define rainPin 13
+#define LED_BUILTIN 2
+#define MotorL_A_Ch 1 // PWM通道
+#define MotorL_B_Ch 2 // PWM通道
+int MOTOR_L = 1;
+
+#define dtime 50 //延时参数，数值越小相应速度越快，反之相应慢   单位毫秒 一般取值（10~100）
+#define tol 50   //照度的相应范围，越小越敏感，反之迟缓  （取值10~100 根据环境光强度不同敏感度也不同，室内光源变化幅度大，阳光下变化小）
+/*以上2参数太小，会对光线的细微变化极其敏感，进而产生抖动，
+  为消除抖动，可以使用滤波处理，或者调节参数，减慢反应时间或敏感度来应对。 */
+
+WiFiClient wificlient;
+PubSubClient mqttClient(wificlient);
+Ticker ticker1;
+Ticker ticker2;
+
+// wifi相关对象及配置
+IPAddress local_ip(192, 168, 1, 1);   // IP for AP mode
+IPAddress gateway(192, 168, 1, 1);    // IP for AP mode
+IPAddress subnet(255, 255, 255, 0);   // IP for AP mode
+WebServer server(80);                 // 建立网络服务器对象，该对象用于响应HTTP请求。监听端口（80）
+const char *SSID_AP = "FOLLOW";       // for AP mode
+const char *PASSWORD_AP = "12345678"; // for AP mode
+
+bool WIFI_Status = true;      // WIFI状态标志位
+int wifi_count = 0;           //时间计数
+bool wifiConfig_flag = false; //
+bool res;                     // NVS保存结果
+
+//设置WiFi接入信息
+char ssid[32] = {0};
+char password[32] = {0};
+const char *mqttServer = "124.223.212.144"; // mqtt服务器IP
+// MQTT服务器账号密码
+const char *mqttId = "admin";
+const char *mqttPwd = "password";
+
+// 遗嘱设置
+const char *willMsg = "CLIENT-OFFLINE"; // 遗嘱消息内容
+const int willQoS = 2;                  // 遗嘱QoS
+const bool willRetain = true;           // 遗嘱保留
+
+//定义系统时间变量，用作定时执行函数
+unsigned long currentMillis = millis();
+unsigned long previousMillis = 0;
+unsigned long period1 = 10000;
+int count1; // Ticker计数用变量
+int count2; // Ticker计数用变量
+
+byte temperature = 0;
+byte humidity = 0;
+int rainState;     // 雨滴传感器状态
+int pinDHT11 = 15; // DHT11温湿度数据引脚
+int dhtDelay = 2000;
+SimpleDHT11 dht11(pinDHT11);
+
+// 水平舵机的设置
+Servo horizontal;          //水平舵机
+int servoh = 90;           //默认角度
+int servohLimitHigh = 175; //水平转动最大角度
+int servohLimitLow = 5;    //水平转动最小角度
+
+// 垂直舵机的设置
+Servo vertical;            //垂直舵机
+int servov = 90;           //默认角度
+int servovLimitHigh = 180; //垂直转动最大角度
+int servovLimitLow = 90;   //垂直转动最小角度
+
+// 4个光敏电阻模块的接线口
+const int ldrlt = 32; //左上
+const int ldrrt = 33; //右上
+const int ldrld = 34; //左下
+const int ldrrd = 35; //右下
+int aLight = 0;
+
+void getLight();
+void followLight();
+void connectWiFi();
+void getMSG();
+void wifiConfig();
+void handleUserRequest();
+bool handleFileRead(String resource);
+void handle_wifi();
+void publishOnlineStatus();
+void connectMQTTServer();
+void pubMQTTmsg();
+void subscribeTopic();
+void tickerCount();
+void rainCount();
+void motorInit();
+void getDHT();
+void motorSet(uint8_t motor, int spe);
+void receiveCallback(char *topic, byte *payload, unsigned int length);
+String getContentType(String filename);
+
+void setup()
+{
+    Serial.begin(115200);
+
+    horizontal.attach(SERVOPINH);
+    vertical.attach(SERVOPINV);
+    horizontal.write(servoh);
+    vertical.write(servov);
+    delay(100);
+    NVS.begin();
+    pinMode(rainPin, INPUT);
+    motorInit();
+    //测试运行情况
+    //测试垂直轴的运行情况，注意检测一下是否有卡住（或者导线缠绕）的情况。
+    //   for (int i = servovLimitLow; i < servovLimitHigh; i += 2)
+    //   {
+    //     vertical.write(i);
+    //     Serial.println("vertical"+i);
+    //     delay(30);
+    //   }
+    vertical.write((servovLimitLow + servovLimitHigh) / 2);
+    //   delay(100);
+    //   //测试水平
+    //   for (int i = 0; i < 180; i += 2)
+    //   {
+    //     horizontal.write(i);
+    //     Serial.println("horizontal"+i);
+    //     delay(30);
+    //   }
+    horizontal.write((servohLimitHigh + servohLimitLow) / 2);
+    //如果测试没有问题，可以去掉此处的代码。
+
+    if (SPIFFS.begin())
+    { // 启动闪存文件系统
+        Serial.println("SPIFFS Started.");
+    }
+    else
+    {
+        Serial.println("SPIFFS Failed to Start.");
+    }
+
+    // 连接WiFi
+    connectWiFi();
+
+    //设置MQTT服务器和端口号
+    mqttClient.setServer(mqttServer, 61613);
+    mqttClient.setKeepAlive(5);
+    //设置MQTT订阅回调函数
+    mqttClient.setCallback(receiveCallback);
+
+    //连接MQTT服务器
+    connectMQTTServer();
+
+    // Ticker定时对象
+    ticker1.attach(1, tickerCount);
+    ticker2.attach(1, rainCount);
+
+    Serial.println(F("System start ..."));
+    delay(5000);
+}
+
+void loop()
+{
+    server.handleClient(); //处理用户请求
+
+    followLight();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        //定时执行获取温湿度函数
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousMillis >= dhtDelay)
+        {                                   // check if 1000ms passed
+            previousMillis = currentMillis; // save the last time you blinked the LED
+            // getElectricity();
+            getDHT();
+            getLight();
+        }
+
+        if (count2 >= 3)
+        {
+            if (digitalRead(rainPin) == 1)
+            {
+                rainState = 1;
+                motorSet(MOTOR_L, 500);
+                delay(2000);
+            }
+        }
+
+        if (mqttClient.connected())
+        { //如果开发板成功连接服务器
+            if (count1 >= 3)
+            {
+                pubMQTTmsg();
+                count1 = 0;
+            }
+            mqttClient.loop(); //保持客户端心跳
+        }
+        else
+        { //如果开发板未能成功连接服务器
+            Serial.println("MQTT服务器连接失败！");
+            connectMQTTServer(); //则尝试连接服务器
+        }
+    }
+}
+
+// 获取平均光照强度
+void getLight()
+{
+    //分别读取4个光敏电阻模块的照度值
+    int lt = analogRead(ldrlt); //左上
+    int rt = analogRead(ldrrt); //右上
+    int ld = analogRead(ldrld); //左下
+    int rd = analogRead(ldrrd); //右下
+
+    aLight = (lt + rt + ld + rd) / 4;
+}
+
+void tickerCount()
+{
+    count1++;
+}
+
+void rainCount()
+{
+    count2++;
+}
+
+// 获取温湿度
+void getDHT()
+{
+    int err = SimpleDHTErrSuccess;
+    if ((err = dht11.read(&temperature, &humidity, NULL)) != SimpleDHTErrSuccess)
+    {
+        Serial.print("Read DHT11 failed, err=");
+        Serial.print(SimpleDHTErrCode(err));
+        Serial.print(",");
+        Serial.println(SimpleDHTErrDuration(err));
+        delay(1000);
+        return;
+    }
+
+    Serial.print("Sample OK: ");
+    Serial.print((int)temperature);
+    Serial.print(" *C, ");
+    Serial.print((int)humidity);
+    Serial.println(" H");
+}
+
+// 电机初始化
+void motorInit(void)
+{
+    ledcSetup(MotorL_A_Ch, 50, 10);
+    ledcAttachPin(motorPin1, MotorL_A_Ch);
+    ledcSetup(MotorL_B_Ch, 50, 10);
+    ledcAttachPin(motorPin2, MotorL_B_Ch);
+}
+
+// 电机设置
+void motorSet(uint8_t motor, int spe)
+{
+    if (motor == MOTOR_L)
+    {
+        if (spe >= 0)
+        {
+            ledcWrite(2, spe);
+            ledcWrite(1, 0);
+        }
+        else
+        {
+            ledcWrite(1, 0 - spe);
+            ledcWrite(2, 0);
+        }
+    }
+}
+
+//连接MQTT服务器
+void connectMQTTServer()
+{
+    //根据ESP32的MAC地址生成客户端ID（避免与其他设备产生冲突）
+    String clientId = "esp32-" + WiFi.macAddress();
+
+    // 建立遗嘱主题。
+    String willString = "Mymqtt/follow/willMessage";
+    char willTopic[willString.length() + 1];
+    strcpy(willTopic, willString.c_str());
+
+    //连接MQTT服务器
+    if (mqttClient.connect(clientId.c_str(), mqttId, mqttPwd, willTopic, willQoS, willRetain, willMsg))
+    {
+        Serial.println("MQTT Server Connected.");
+        Serial.println("Server Address:");
+        Serial.println(mqttServer);
+        Serial.println("ClientId:");
+        Serial.println(clientId);
+
+        publishOnlineStatus(); //发布在线状态
+        subscribeTopic();      //订阅指定主题
+    }
+    else
+    {
+        Serial.println("MQTT Server Connect Failed.Client State: ");
+        Serial.println(mqttClient.state());
+        delay(2000);
+    }
+}
+
+//订阅MQTT消息
+void subscribeTopic()
+{
+    //订阅获取RGB灯主题信息
+    String switchTopic = "Mymqtt/module1/switchCMD";
+    char subSwitchTopic[switchTopic.length() + 1];
+    strcpy(subSwitchTopic, switchTopic.c_str());
+
+    // 通过串口监视器输出是否成功订阅主题以及订阅的主题名称
+    if (mqttClient.subscribe(subSwitchTopic))
+    {
+        Serial.println("Subscrib Topic:");
+        Serial.println(subSwitchTopic);
+    }
+    else
+    {
+        Serial.print("Subscribe Fail...");
+    }
+}
+
+// 收到信息后的回调函数
+void receiveCallback(char *topic, byte *payload, unsigned int length)
+{
+    Serial.print("Message Received [");
+    Serial.print(topic);
+    Serial.print("] ");
+    for (int i = 0; i < length; i++)
+    {
+        Serial.print((char)payload[i]);
+    }
+    Serial.println("");
+    Serial.print("Message Length(Bytes) ");
+    Serial.println(length);
+}
+
+// 发布在线信息
+void publishOnlineStatus()
+{
+    // 建立遗嘱主题。
+    String willString = "Mymqtt/follow/willMessage";
+    char willTopic[willString.length() + 1];
+    strcpy(willTopic, willString.c_str());
+
+    // 建立设备在线的消息。此信息将以保留形式向遗嘱主题发布
+    String onlineMessageString = "CLIENT-ONLINE";
+    char onlineMsg[onlineMessageString.length() + 1];
+    strcpy(onlineMsg, onlineMessageString.c_str());
+
+    // 向遗嘱主题发布设备在线消息
+    if (mqttClient.publish(willTopic, onlineMsg, true))
+    {
+        Serial.print("Published Online Message: ");
+        Serial.println(onlineMsg);
+    }
+    else
+    {
+        Serial.println("Online Message Publish Failed.");
+    }
+}
+
+//发布MQTT信息
+void pubMQTTmsg()
+{
+
+    //建立发布用电信息主题。主题名称为“electricity”，位于“mymqtt”主题下一级
+    String dhtTopic = "Mymqtt/follow/dht11";
+    char publishelDHTTopic[dhtTopic.length() + 1];
+    strcpy(publishelDHTTopic, dhtTopic.c_str());
+
+    //建立发布光照强度信息。
+    rainState = digitalRead(rainPin);
+    String payload = "{";
+    payload += "\"temp\":";
+    payload += temperature;
+    payload += ",";
+    payload += "\"humi\":";
+    payload += humidity;
+    payload += ",";
+    payload += "\"rain\":";
+    payload += rainState;
+    payload += ",";
+    payload += "\"light\":";
+    payload += aLight;
+    payload += "}";
+    char attributes[100];
+    payload.toCharArray(attributes, 100);
+    //实现8266向主题发布信息
+    if (mqttClient.publish(publishelDHTTopic, attributes))
+    {
+        // 温湿度信息
+        Serial.print("Publish Topic:");
+        Serial.println(publishelDHTTopic);
+        Serial.print("Publish Message:");
+        Serial.println(attributes);
+    }
+    else
+    {
+        Serial.println("Message Publish Failed.");
+    }
+}
+
+// 追光程序
+void followLight()
+{
+    //分别读取4个光敏电阻模块的照度值
+    int lt = analogRead(ldrlt); //左上
+    int rt = analogRead(ldrrt); //右上
+    int ld = analogRead(ldrld); //左下
+    int rd = analogRead(ldrrd); //右下
+
+    //将邻近光敏电阻模块的读数平均
+    int avt = (lt + rt) / 2;
+    int avd = (ld + rd) / 2;
+    int avl = (lt + ld) / 2;
+    int avr = (rt + rd) / 2;
+
+    //再计算上下行和左右排平均值的差值
+    int dvert = avt - avd; //上下行
+    int dhoriz = avl - avr;
+
+    //检查差异是否在公差范围内，否则改变垂直角度
+    if (-1 * tol > dvert || dvert > tol)
+    {
+        if (avt < avd)
+        {
+            servov = ++servov;
+            if (servov > servovLimitHigh)
+            {
+                servov = servovLimitHigh;
+            }
+        }
+        else if (avt > avd)
+        {
+            servov = --servov;
+            if (servov < servovLimitLow)
+            {
+                servov = servovLimitLow;
+            }
+        }
+        vertical.write(servov); //舵机旋转角度和光线相反的话 用(180- servov)或 (servov) 调换方向即可
+    }
+
+    //检查差异是否在公差范围内，否则改变水平角度
+    if (-1 * tol > dhoriz || dhoriz > tol)
+    {
+        if (avl < avr)
+        {
+            servoh = --servoh;
+            if (servoh < servohLimitLow)
+            {
+                servoh = servohLimitLow;
+            }
+        }
+        else if (avl > avr)
+        {
+            servoh = ++servoh;
+            if (servoh > servohLimitHigh)
+            {
+                servoh = servohLimitHigh;
+            }
+        }
+        horizontal.write(servoh); //舵机旋转角度和光线相反的话 用(180- servoh) 或 (servoh) 调换方向即可
+    }
+    delay(dtime);
+}
+
+/*连接网络*/
+void connectWiFi()
+{
+    getMSG();
+    delay(1000);
+    WiFi.mode(WIFI_STA); //设置STA模式
+    Serial.println(ssid);
+    Serial.println(password);
+    WiFi.begin(ssid, password);
+    Serial.println("\r\n正在连接WIFI...");
+    wifi_count = 0;
+    while (WiFi.status() != WL_CONNECTED) //判断是否连接WIFI成功
+    {
+        if (WIFI_Status)
+        {
+            Serial.print(".");
+            digitalWrite(LED_BUILTIN, HIGH);
+            delay(500);
+            digitalWrite(LED_BUILTIN, LOW);
+            delay(500);
+            wifi_count++;
+            // wifi_count++;
+            if (wifi_count >= 20)
+            {
+                WIFI_Status = false;
+                Serial.println("WiFi连接失败，请用手机进行配网");
+            }
+        }
+        else if (!wifiConfig_flag)
+        {
+            wifiConfig(); // web配网
+            break;
+        }
+        delay(10);
+    }
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        local_ip = WiFi.localIP();
+        Serial.println("连接成功");
+        Serial.print("SSID:");
+        Serial.println(ssid);
+        Serial.print("IP:");
+        Serial.println(local_ip);
+    }
+}
+
+// 保存配网数据
+bool saveMSG(String ssid, String password)
+{
+    // write to flash
+    const String s = ssid;
+    const String p = password;
+    res = NVS.setString("ssid", s);
+    if (res)
+    {
+        Serial.println("wifi_ssid saved successfully!");
+    }
+    else
+    {
+        Serial.println("wifi_ssid saving failed!");
+        return false;
+    }
+    res = NVS.setString("password", p);
+    if (res)
+    {
+        Serial.println("wifi_password saved successfully!");
+    }
+    else
+    {
+        Serial.println("wifi_password saving failed!");
+        return false;
+    }
+    return true;
+}
+
+// 获取配网数据
+void getMSG()
+{
+    // read from flash
+    String s = NVS.getString("ssid");
+    String p = NVS.getString("password");
+    String sl = NVS.getString("scrLight");
+    Serial.print("wifi_ssid:");
+    Serial.println(s);
+    Serial.print("password:");
+    Serial.println(p);
+    Serial.print("screen light:");
+    Serial.println(sl);
+    strcpy(ssid, s.c_str());
+    strcpy(password, p.c_str());
+}
+
+// Web网页配网
+void wifiConfig()
+{
+    wifiConfig_flag = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(SSID_AP, PASSWORD_AP);
+    delay(2000);
+    WiFi.softAPConfig(local_ip, gateway, subnet);
+
+    server.on("/wifi", handle_wifi); // 告知系统如何处理请求
+    server.onNotFound(handleUserRequest);
+
+    server.begin(); // 启动网站服务
+    Serial.println("HTTP server started");
+}
+
+// 接收网页wifi信息
+void handle_wifi()
+{
+    String ssid = server.arg("ssid");
+    String password = server.arg("password");
+    String scrLight = server.arg("scrLight");
+    Serial.print("New ssid: ");
+    Serial.println(ssid);
+    Serial.print("New password: ");
+    Serial.println(password);
+    Serial.print("New screen light: ");
+    Serial.println(scrLight);
+    if (!saveMSG(ssid, password))
+    {
+        server.send(200, "text/html", "NO");
+    }
+    connectWiFi();
+}
+
+// 处理用户浏览器的HTTP访问
+void handleUserRequest()
+{
+    // 获取用户请求资源(Request Resource）
+    String reqResource = server.uri();
+    Serial.print("reqResource: ");
+    Serial.println(reqResource);
+
+    // 通过handleFileRead函数处处理用户请求资源
+    bool fileReadOK = handleFileRead(reqResource);
+
+    // 如果在SPIFFS无法找到用户访问的资源，则回复404 (Not Found)
+    if (!fileReadOK)
+    {
+        server.send(404, "text/plain", "404 Not Found");
+    }
+}
+
+//处理浏览器HTTP访问
+bool handleFileRead(String resource)
+{
+    if (resource.endsWith("/"))
+    {                             // 如果访问地址以"/"为结尾
+        resource = "/index.html"; // 则将访问地址修改为/index.html便于SPIFFS访问
+    }
+
+    String contentType = getContentType(resource); // 获取文件类型
+
+    if (SPIFFS.exists(resource))
+    {                                           // 如果访问的文件可以在SPIFFS中找到
+        File file = SPIFFS.open(resource, "r"); // 则尝试打开该文件
+        server.streamFile(file, contentType);   // 并且将该文件返回给浏览器
+        file.close();                           // 并且关闭文件
+        return true;                            // 返回true
+    }
+    return false; // 如果文件未找到，则返回false
+}
+
+// 获取文件类型
+String getContentType(String filename)
+{
+    if (filename.endsWith(".htm"))
+        return "text/html";
+    else if (filename.endsWith(".html"))
+        return "text/html";
+    else if (filename.endsWith(".css"))
+        return "text/css";
+    else if (filename.endsWith(".js"))
+        return "application/javascript";
+    else if (filename.endsWith(".png"))
+        return "image/png";
+    else if (filename.endsWith(".gif"))
+        return "image/gif";
+    else if (filename.endsWith(".jpg"))
+        return "image/jpeg";
+    else if (filename.endsWith(".ico"))
+        return "image/x-icon";
+    else if (filename.endsWith(".xml"))
+        return "text/xml";
+    else if (filename.endsWith(".pdf"))
+        return "application/x-pdf";
+    else if (filename.endsWith(".zip"))
+        return "application/x-zip";
+    else if (filename.endsWith(".gz"))
+        return "application/x-gzip";
+    return "text/plain";
+}

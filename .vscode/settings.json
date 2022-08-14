@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.cpp": "arduino-output",
+        "algorithm": "cpp",
+        "*.txt": "cpp"
+    }
+}
